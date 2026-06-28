@@ -11,7 +11,7 @@
 --     encoded integers — 4–10× less memory and faster GROUP BY / ORDER BY.
 --
 -- Auto-applied on first `docker compose up` because this file is mounted to
--- /docker-entrypoint-initdb.d/ in the ClickHouse container.
+-- /docker-entrypoint-initdb.d/ in the ClickHouse container
 -- =============================================================================
 
 CREATE DATABASE IF NOT EXISTS imdb;
