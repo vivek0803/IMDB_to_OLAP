@@ -11,33 +11,42 @@ A fully containerised, end-to-end ELT pipeline that:
 ## Architecture
 
 ```
-┌────────────┐    TSV files     ┌─────────────────────────────────┐
-│  Kaggle    │ ───────────────► │  data/raw/                      │
-│  API       │                  │  title.basics.tsv  (~1 GB)      │
-└────────────┘                  │  title.ratings.tsv (~30 MB)     │
-                                │  title.episode.tsv (~250 MB)    │
-                                └──────────────┬──────────────────┘
-                                               │ etl_job.py
-                                               │ (PySpark cluster)
-                                               ▼
-                                ┌─────────────────────────────────┐
-                                │  data/lake/  (Snappy Parquet)   │
-                                │  titles/                        │
-                                │    titleType=movie/             │
-                                │      decade=1990/part-0.parquet │
-                                │      decade=2000/part-0.parquet │
-                                │    titleType=tvSeries/ …        │
-                                │  episodes/                      │
-                                │    seasonBucket=01/ …           │
-                                └──────────────┬──────────────────┘
-                                               │ load_to_olap.py
-                                               │ (clickhouse-connect)
-                                               ▼
-                                ┌─────────────────────────────────┐
-                                │  ClickHouse (Docker)            │
-                                │  imdb.titles      MergeTree     │
-                                │  imdb.episodes    MergeTree     │
-                                └─────────────────────────────────┘
+┌────────────┐    TSV files     ┌───────────────────────────────────┐
+│  Kaggle    │ ───────────────► │  data/raw/                        │
+│  API       │                  │  title.basics.tsv                  │
+└────────────┘                  │  title.ratings.tsv                 │
+                                │  name.basics.tsv                   │
+                                │  title.principals.tsv              │
+                                │  title.akas.tsv                    │
+                                └────────────────┬──────────────────┘
+                                                 │ etl_job.py
+                                                 │ (PySpark cluster)
+                                                 ▼
+                                ┌───────────────────────────────────┐
+                                │  data/lake/  (Snappy Parquet)     │
+                                │  titles/                          │
+                                │    titleType=movie/decade=1990/…  │
+                                │    titleType=unknown/decade=.../… │
+                                │  people/                          │
+                                │    primaryProfession0=actor/…     │
+                                │  principals/                      │
+                                │    category=director/…            │
+                                │  akas/                            │
+                                │    region=US/…                    │
+                                │    region=XX/…                    │
+                                └────────────────┬──────────────────┘
+                                                 │ load_to_olap.py
+                                                 │ (clickhouse-connect)
+                                                 ▼
+                                ┌───────────────────────────────────┐
+                                │  ClickHouse (Docker)              │
+                                │  imdb.titles       MergeTree      │
+                                │  imdb.people       MergeTree      │
+                                │  imdb.principals   MergeTree      │
+                                │  imdb.akas         MergeTree      │
+                                │  views: top_movies,               │
+                                │         director_filmography      │
+                                └───────────────────────────────────┘
 ```
 
 **Docker Compose services**
@@ -104,7 +113,7 @@ make download
 ```bash
 make etl
 # Runs etl_job.py on the Spark cluster (spark-master container)
-# Output: data/lake/titles/ and data/lake/episodes/ (Snappy Parquet)
+# Output: data/lake/titles/, people/, principals/, akas/ (Snappy Parquet)
 # Runtime: ~5–15 min depending on hardware
 ```
 
@@ -120,7 +129,7 @@ make load
 
 ```bash
 make benchmark
-# Runs the three analytical queries directly on ClickHouse and prints timing
+# Runs analytical queries across the ClickHouse tables and prints timing
 ```
 
 ---
@@ -138,13 +147,19 @@ PySpark job submitted to the Spark cluster via `spark-submit`. Key steps:
 
 1. **Read** TSV files with `nullValue="\\N"` (IMDb's null sentinel)
 2. **Cast** string columns to proper types (integers, floats)
-3. **Derive** `decade = (startYear / 10 * 10)` and `primaryGenre = genres[0]`
-4. **Split** `genres` string → `Array(String)`
-5. **Join** `title_basics` LEFT JOIN `title_ratings` → `titles_df`
-6. **Join** `title_episodes` + `title_basics` + `title_ratings` → `episodes_df`
+3. **Normalize** missing partition values (`titleType` → `unknown`, `region` → `XX`, etc.)
+4. **Derive** `decade = (startYear / 10 * 10)` and `primaryGenre = genres[0]`
+5. **Split** multi-value strings like `genres`, `primaryProfession`, and `knownForTitles` into arrays
+6. **Join** `title_basics` LEFT JOIN `title_ratings` → `titles_df`
 7. **Write** Snappy Parquet partitioned by:
    - `titles/`: `titleType`, `decade`
-   - `episodes/`: `seasonBucket` (seasons 1–20 individual; >20 → "21+"; null → "unknown")
+   - `people/`: `primaryProfession0`
+   - `principals/`: `category`
+   - `akas/`: `region`
+
+There is no `episodes/` partition in the current pipeline. `title.episode.tsv`
+is not part of the downloaded/loaded datasets, so no `imdb.episodes` table is
+created.
 
 ### `load_to_olap.py`
 
@@ -159,8 +174,8 @@ python3 load_to_olap.py --help
 # Re-run safely (truncates tables first)
 python3 load_to_olap.py --truncate
 
-# Skip one dataset
-python3 load_to_olap.py --skip-episodes
+# Load only selected datasets
+python3 load_to_olap.py --only titles principals
 ```
 
 ---
@@ -181,6 +196,8 @@ data/lake/titles/
     …
   titleType=short/
     …
+  titleType=unknown/
+    decade=__HIVE_DEFAULT_PARTITION__/…
 ```
 
 **Why this combination?**
@@ -193,20 +210,60 @@ A query like `WHERE titleType='movie' AND decade=1990` skips every other
 partition directory entirely — both Spark's predicate pushdown and
 ClickHouse's `PARTITION BY` clause exploit this.
 
-### `data/lake/episodes/` — `partitionBy("seasonBucket")`
+Missing or blank `titleType` is kept as `unknown`, not dropped. If IMDb adds a
+new title type later, the ETL writes it as its own `titleType=<new_value>/`
+partition.
+
+### `data/lake/people/` — `partitionBy("primaryProfession0")`
 
 ```
-data/lake/episodes/
-  seasonBucket=01/   ← Season 1 episodes
-  seasonBucket=02/   ← Season 2 episodes
-  …
-  seasonBucket=20/
-  seasonBucket=21+/  ← Seasons beyond 20
-  seasonBucket=unknown/  ← NULL season (specials, pilots)
+data/lake/people/
+  primaryProfession0=actor/
+  primaryProfession0=director/
+  primaryProfession0=writer/
+  primaryProfession0=unknown/
 ```
 
-Season is the natural partition for TV series queries:
-"all episodes in Season 3 across all shows" reads only `seasonBucket=03/`.
+`primaryProfession0` is the first profession listed in `name.basics.tsv`.
+Missing/empty professions are retained under `unknown`. This layout helps
+queries that focus on one profession, such as "all directors born after 1970".
+
+### `data/lake/principals/` — `partitionBy("category")`
+
+```
+data/lake/principals/
+  category=actor/
+  category=director/
+  category=producer/
+  category=self/
+  category=unknown/
+```
+
+`category` is the cast/crew role from `title.principals.tsv`. Values like
+`actor`, `director`, `writer`, `producer`, and `self` are valid IMDb categories.
+Missing categories are retained as `unknown`.
+
+### `data/lake/akas/` — `partitionBy("region")`
+
+```
+data/lake/akas/
+  region=US/
+  region=GB/
+  region=IN/
+  region=XX/
+```
+
+`region` is the alternate-title market/country code from `title.akas.tsv`.
+Missing or blank regions are kept as `XX`, so alternate-title rows are not
+dropped just because region is unknown.
+
+### Why There Is No `episodes/` Partition
+
+The current pipeline does not ingest `title.episode.tsv`, so it does not write
+`data/lake/episodes/` and does not create `imdb.episodes`. TV episodes still
+exist in `imdb.titles` as rows where `titleType = 'tvEpisode'`; what is missing
+is the parent-series relationship and season/episode numbering from
+`title.episode.tsv`.
 
 ---
 
@@ -220,27 +277,60 @@ startup (mounted to `/docker-entrypoint-initdb.d/`).
 ```sql
 ENGINE = MergeTree()
 PARTITION BY (titleType, intDiv(coalesce(startYear, 0), 10))
-ORDER BY (titleType, startYear, tconst)
+ORDER BY (titleType, coalesce(startYear, 0), tconst)
 ```
 
-- `PARTITION BY` mirrors the Parquet partition layout.
+- `PARTITION BY` mirrors the title lake layout: title category plus decade.
 - `ORDER BY` builds the sparse primary index: only 1 index entry per 8192
   rows. A range query on `(titleType, startYear)` reads a tiny fraction of
   the column files.
 - `LowCardinality(String)` on `titleType` and `primaryGenre` stores values
   as dictionary-encoded integers — 4–10× less memory and faster GROUP BY.
 
-### `imdb.episodes`
+### `imdb.people`
 
 ```sql
 ENGINE = MergeTree()
-PARTITION BY coalesce(seasonNumber, 0)
-ORDER BY (parentTconst, seasonNumber, episodeNumber, tconst)
+ORDER BY nconst
 ```
 
-- All episodes of a series are physically co-located on disk (same sort key
-  prefix). "All episodes of Breaking Bad" requires reading a single
-  contiguous index range.
+- Person lookup table from `name.basics.tsv`.
+- No ClickHouse `PARTITION BY` is used because lookups and joins are primarily
+  by `nconst`, and partitioning by profession would duplicate logic already
+  present in the Parquet lake without much benefit for point lookups.
+
+### `imdb.principals`
+
+```sql
+ENGINE = MergeTree()
+PARTITION BY category
+ORDER BY (tconst, ordering)
+```
+
+- Cast/crew bridge between `imdb.titles` and `imdb.people`.
+- `PARTITION BY category` helps role-specific queries such as directors,
+  actors, writers, producers, or `self`.
+- `ORDER BY (tconst, ordering)` keeps all principal credits for a title close
+  together and preserves IMDb billing order.
+
+### `imdb.akas`
+
+```sql
+ENGINE = MergeTree()
+PARTITION BY region
+ORDER BY (titleId, region, ordering)
+```
+
+- Alternate titles by region and language from `title.akas.tsv`.
+- `PARTITION BY region` supports localized-title queries such as "all French
+  alternate titles" or "all Indian market titles".
+- Missing/blank regions are loaded as `XX`, matching the Parquet lake.
+
+### Views And Projections
+
+- `imdb.titles` has projection `proj_genre_stats` for fast genre/title-type/decade aggregations.
+- `imdb.top_movies` is a view over high-vote movie titles.
+- `imdb.director_filmography` joins `principals`, `titles`, and `people` for director credits.
 
 ---
 
@@ -248,13 +338,14 @@ ORDER BY (parentTconst, seasonNumber, episodeNumber, tconst)
 
 ### The benchmark problem
 
-Consider these three queries against ~10 M titles + ~8 M episodes:
+Consider these queries across titles, people, principals, and alternate titles:
 
 | Query | Spark on Parquet | ClickHouse | Speedup |
 |-------|-----------------|------------|---------|
 | Avg rating by decade (movies only) | ~12 s | ~15 ms | ~800× |
 | Top genres by avg rating (≥10k votes) | ~18 s | ~25 ms | ~700× |
-| Series episode count + avg rating | ~22 s | ~40 ms | ~550× |
+| Most-credited actors with names | ~20 s | ~40 ms | ~500× |
+| Alternate title counts by region | ~10 s | ~20 ms | ~500× |
 
 *(Timings on a MacBook M2 Pro, 16 GB RAM, single ClickHouse node vs local Spark)*
 
@@ -343,16 +434,22 @@ GROUP BY primaryGenre
 ORDER BY avg_rating DESC
 LIMIT 20;
 
--- TV series with the most episodes + their avg episode rating
+-- Most-credited actors with names
 SELECT
-    parentTconst,
-    count()                       AS episode_count,
-    countDistinct(seasonNumber)   AS season_count,
-    round(avg(averageRating), 2)  AS avg_ep_rating
-FROM imdb.episodes
-WHERE averageRating IS NOT NULL
-GROUP BY parentTconst
-ORDER BY episode_count DESC
+    a.nconst,
+    p.primaryName,
+    a.title_count
+FROM
+(
+    SELECT nconst, count() AS title_count
+    FROM imdb.principals
+    WHERE category = 'actor'
+    GROUP BY nconst
+    ORDER BY title_count DESC
+    LIMIT 20
+) AS a
+LEFT JOIN imdb.people AS p ON p.nconst = a.nconst
+ORDER BY a.title_count DESC
 LIMIT 20;
 
 -- Rating trend over time for movies (decade view)
@@ -367,21 +464,32 @@ WHERE titleType = 'movie'
 GROUP BY decade
 ORDER BY decade;
 
--- Best episodes per top-rated series
+-- Alternate titles per region
 SELECT
-    e.parentTconst,
-    e.primaryTitle  AS episode_title,
-    e.seasonNumber,
-    e.episodeNumber,
-    e.averageRating
-FROM imdb.episodes e
-WHERE e.parentTconst IN (
-    SELECT parentTconst
-    FROM imdb.series_summary
-    ORDER BY avg_episode_rating DESC
-    LIMIT 5
-)
-ORDER BY e.parentTconst, e.seasonNumber, e.episodeNumber;
+    region,
+    count() AS aka_count
+FROM imdb.akas
+GROUP BY region
+ORDER BY aka_count DESC
+LIMIT 10;
+
+-- Most-credited directors with names
+SELECT
+    d.nconst,
+    p.primaryName,
+    d.film_count
+FROM
+(
+    SELECT nconst, count() AS film_count
+    FROM imdb.principals
+    WHERE category = 'director'
+    GROUP BY nconst
+    ORDER BY film_count DESC
+    LIMIT 20
+) AS d
+LEFT JOIN imdb.people AS p ON p.nconst = d.nconst
+ORDER BY d.film_count DESC
+LIMIT 20;
 ```
 
 ---
