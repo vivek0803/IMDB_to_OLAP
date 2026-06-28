@@ -1,4 +1,4 @@
-.PHONY: help up down download etl load benchmark clean
+.PHONY : help up down download etl load benchmark clean
 
 # Load .env if it exists
 -include .env
